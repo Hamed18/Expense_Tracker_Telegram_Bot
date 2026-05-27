@@ -37,24 +37,14 @@ Time Utilities: Carbon (Timezone & Date Aggregation)
 
 | Command | Syntax | Description |
 | :--- | :--- | :--- |
-| `/start` | `/start` | Initializes user session and displays the interactive guide. |
-| `/income` | `/income [amount] [optional description]` | Logs a positive revenue inflow. |
-| `/expense` | `/expense [amount] [optional description]` | Logs a financial cost or expenditure. |
-| `/report` | `/report` | Outputs today's line-by-line itemized ledger and totals. |
-| `/report monthly` | `/report monthly` | Renders a day-by-day nested chronological monthly summary. |
-| `/reset` | `/reset` | Permanently deletes all your transactions from the database. |
+| `/start` | Initializes user session and displays the interactive guide. |
+| `/income [amount] [optional description]` | Logs a positive revenue inflow. |
+| `/expense [amount] [optional description]` | Logs a financial cost or expenditure. |
+| `/report` | Outputs today's line-by-line itemized ledger and totals. |
+| `/report monthly` | Renders a day-by-day nested chronological monthly summary. |
+| `/reset` | Permanently deletes all your transactions from the database. |
 
 ---
-
-## 💻 Installation & Local Setup
-
-### 1. Clone & Install Dependencies
-```bash
-git clone [https://github.com/yourusername/telegram-expense-tracker.git](https://github.com/yourusername/telegram-expense-tracker.git)
-cd telegram-expense-tracker
-composer install
-
-```
 
 ### 2. Environment Configuration
 
