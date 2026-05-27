@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
-use App\Models\TgUser;
 use App\Models\Transaction;
+use App\Models\TgUser;
 use App\Services\TelegramService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -21,61 +21,54 @@ class TelegramController extends Controller
     ) {}
 
     /**
-     * Entry-point for all incoming Telegram webhook updates.
+     * Entry point for all incoming Telegram webhook payloads.
      */
     public function handle(Request $request): Response
     {
-        $update = $request->json()->all();
+        $payload = $request->json()->all();
 
-        // Guard: only process plain text messages
-        $message = $update['message'] ?? null;
-        if (! $message || ! isset($message['text'])) {
+        if (empty($payload['message'])) {
             return response('OK', 200);
         }
 
-        $chatId    = (string) $message['chat']['id'];
-        $text      = trim($message['text']);
-        $from      = $message['from'] ?? [];
+        $message = $payload['message'];
+        $from    = $message['from'] ?? [];
+        $chatId  = (string) ($message['chat']['id'] ?? '');
+        $text    = trim($message['text'] ?? '');
+
+        if ($chatId === '' || $text === '') {
+            return response('OK', 200);
+        }
 
         try {
-            // Auto-register user on first interaction
-            $user = $this->resolveUser($chatId, $from);
+            $user = TgUser::firstOrCreate(
+                ['chat_id' => $chatId],
+                [
+                    'first_name' => $from['first_name'] ?? null,
+                    'username'   => $from['username']   ?? null,
+                ]
+            );
 
-            // Route to the correct command handler
-            $this->route($chatId, $text, $user);
+            $this->dispatch($user, $chatId, $text);
         } catch (Throwable $e) {
-            Log::error('TelegramController error', ['exception' => $e->getMessage()]);
-            $this->telegram->sendMessage($chatId, '⚠️ An internal error occurred. Please try again later.');
+            Log::error('Telegram webhook error', [
+                'chat_id' => $chatId,
+                'error'   => $e->getMessage(),
+            ]);
+            $this->telegram->sendMessage(
+                $chatId,
+                '⚠️ An unexpected error occurred. Please try again.'
+            );
         }
 
         return response('OK', 200);
     }
 
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------
+    //  Command Router
+    // ---------------------------------------------------------------
 
-    /**
-     * Find or create the TgUser record for this chat_id.
-     */
-    private function resolveUser(string $chatId, array $from): TgUser
-    {
-        return TgUser::firstOrCreate(
-            ['chat_id' => $chatId],
-            [
-                'first_name' => $from['first_name'] ?? null,
-                'username'   => $from['username']   ?? null,
-            ]
-        );
-    }
-
-    /**
-     * Parse the incoming text and dispatch to the right handler.
-     */
-    /**
-     * Parse the incoming text and dispatch to the right handler safely.
-     */
-    private function route(string $chatId, string $text, TgUser $user): void
+    private function dispatch(TgUser $user, string $chatId, string $text): void
     {
         // /start
         if (preg_match('/^\/start$/i', $text)) {
@@ -84,34 +77,45 @@ class TelegramController extends Controller
         }
 
         // /income <amount> [optional description]
-        if (preg_match('/^\/income\s+(\d+(?:\.\d{1,2})?)\s*(.*)$/i', $text, $m)) {
-            $amount = $m[1];
-            $description = !empty($m[2]) ? trim($m[2]) : 'Uncategorized Income';
-            $this->handleTransaction($chatId, $user, 'income', $amount, $description);
+        if (preg_match('/^\/income\s+(\d+(?:\.\d{1,2})?)\s*(.*)$/i', $text, $matches)) {
+            $description = trim($matches[2]) !== '' ? trim($matches[2]) : 'Uncategorized Income';
+            $this->handleTransaction($user, $chatId, 'income', $matches[1], $description);
             return;
         }
 
         // /expense <amount> [optional description]
-        if (preg_match('/^\/expense\s+(\d+(?:\.\d{1,2})?)\s*(.*)$/i', $text, $m)) {
-            $amount = $m[1];
-            $description = !empty($m[2]) ? trim($m[2]) : 'Uncategorized Expense';
-            $this->handleTransaction($chatId, $user, 'expense', $amount, $description);
+        if (preg_match('/^\/expense\s+(\d+(?:\.\d{1,2})?)\s*(.*)$/i', $text, $matches)) {
+            $description = trim($matches[2]) !== '' ? trim($matches[2]) : 'Uncategorized Expense';
+            $this->handleTransaction($user, $chatId, 'expense', $matches[1], $description);
             return;
         }
 
-        // /report
+        // /report monthly
+        if (preg_match('/^\/report\s+monthly$/i', $text)) {
+            $this->handleMonthlyReport($user, $chatId);
+            return;
+        }
+
+        // /report (daily)
         if (preg_match('/^\/report$/i', $text)) {
-            $this->handleReport($chatId, $user);
+            $this->handleReport($user, $chatId);
             return;
         }
 
-        // Unknown input — show friendly syntax guide
+        // /reset
+        if (preg_match('/^\/reset$/i', $text)) {
+            $this->handleReset($user, $chatId);
+            return;
+        }
+
+        // Unknown / malformed input
         $this->handleUnknown($chatId);
     }
 
-    /**
-     * /start — welcome message with usage guide.
-     */
+    // ---------------------------------------------------------------
+    //  Handlers
+    // ---------------------------------------------------------------
+
     private function handleStart(string $chatId, TgUser $user): void
     {
         $name = $user->first_name ?? 'there';
@@ -131,7 +135,12 @@ class TelegramController extends Controller
 
         📊 *Daily Report*
         `/report`
-        _Shows today's total income, expenses, and net balance._
+
+        📅 *Monthly Report*
+        `/report monthly`
+
+        🗑 *Reset Data*
+        `/reset`
 
         ---
         All amounts are treated as *BDT* by default.
@@ -141,12 +150,9 @@ class TelegramController extends Controller
         $this->telegram->sendMessage($chatId, $msg);
     }
 
-    /**
-     * /income or /expense — validate, persist, and confirm.
-     */
     private function handleTransaction(
-        string $chatId,
         TgUser $user,
+        string $chatId,
         string $type,
         string $rawAmount,
         string $description
@@ -156,7 +162,7 @@ class TelegramController extends Controller
         if ($amount <= 0) {
             $this->telegram->sendMessage(
                 $chatId,
-                '⚠️ Amount must be greater than *0*. Please try again.'
+                '❌ *Invalid amount.* Please enter a positive number greater than zero.'
             );
             return;
         }
@@ -170,49 +176,48 @@ class TelegramController extends Controller
             ]);
         });
 
-        if ($type === 'income') {
-            $emoji  = '✅';
-            $label  = 'Income';
-            $symbol = '+';
-        } else {
-            $emoji  = '🔴';
-            $label  = 'Expense';
-            $symbol = '-';
-        }
-
         $formatted = number_format($amount, 2);
 
-        $msg = <<<MSG
-        {$emoji} *{$label} Recorded*
+        if ($type === 'income') {
+            $msg = <<<MSG
+            ✅ *Income Recorded*
 
-        💰 Amount      : `{$symbol}{$formatted} BDT`
-        📝 Description : {$description}
-        🕒 Time        : {$this->nowFormatted()}
-        MSG;
+            💰 Amount      : `+{$formatted} BDT`
+            📝 Description : {$description}
+            🕒 Time        : {$this->nowFormatted()}
+            MSG;
+        } else {
+            $msg = <<<MSG
+            🔴 *Expense Recorded*
+
+            💰 Amount      : `-{$formatted} BDT`
+            📝 Description : {$description}
+            🕒 Time        : {$this->nowFormatted()}
+            MSG;
+        }
 
         $this->telegram->sendMessage($chatId, $msg);
     }
 
-    /**
-     * /report — today's aggregated income, expense, and balance.
-     */
-    private function handleReport(string $chatId, TgUser $user): void
+    private function handleReport(TgUser $user, string $chatId): void
     {
         $today = Carbon::today();
 
-        $rows = Transaction::query()
+        $totals = Transaction::query()
             ->where('tg_user_id', $user->id)
             ->whereDate('created_at', $today)
-            ->selectRaw("type, SUM(amount) as total")
-            ->groupBy('type')
-            ->pluck('total', 'type');
+            ->selectRaw("
+                COALESCE(SUM(CASE WHEN type = 'income'  THEN amount ELSE 0 END), 0) AS total_income,
+                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense
+            ")
+            ->first();
 
-        $income  = (float) ($rows['income']  ?? 0);
-        $expense = (float) ($rows['expense'] ?? 0);
+        $income  = (float) $totals->total_income;
+        $expense = (float) $totals->total_expense;
         $balance = $income - $expense;
 
-        $balanceEmoji = $balance >= 0 ? '🟢' : '🔴';
-        $balanceSign  = $balance >= 0 ? '+' : '';
+        $balanceIcon = $balance >= 0 ? '🟢' : '🔴';
+        $balanceSign = $balance >= 0 ? '+' : '-';
 
         $msg = <<<MSG
         📊 *Daily Report — {$today->format('d M Y')}*
@@ -220,15 +225,66 @@ class TelegramController extends Controller
         ✅ *Total Income*  : `+{$this->fmt($income)} BDT`
         🔴 *Total Expense* : `-{$this->fmt($expense)} BDT`
         ─────────────────────────
-        {$balanceEmoji} *Net Balance*  : `{$balanceSign}{$this->fmt($balance)} BDT`
+        {$balanceIcon} *Net Balance*  : `{$balanceSign}{$this->fmt($balance)} BDT`
         MSG;
 
         $this->telegram->sendMessage($chatId, $msg);
     }
 
-    /**
-     * Fallback for unrecognised commands.
-     */
+    private function handleMonthlyReport(TgUser $user, string $chatId): void
+    {
+        $now        = Carbon::now();
+        $monthStart = $now->copy()->startOfMonth();
+        $monthEnd   = $now->copy()->endOfMonth();
+        $monthLabel = $now->format('F Y');
+
+        $totals = Transaction::query()
+            ->where('tg_user_id', $user->id)
+            ->whereBetween('created_at', [$monthStart, $monthEnd])
+            ->selectRaw("
+                COALESCE(SUM(CASE WHEN type = 'income'  THEN amount ELSE 0 END), 0) AS total_income,
+                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense,
+                COUNT(*) AS total_transactions
+            ")
+            ->first();
+
+        $income  = (float) ($totals->total_income  ?? 0);
+        $expense = (float) ($totals->total_expense ?? 0);
+        $txCount = (int)   ($totals->total_transactions ?? 0);
+        $balance = $income - $expense;
+
+        $balanceIcon = $balance >= 0 ? '🟢' : '🔴';
+        $balanceSign = $balance >= 0 ? '+' : '-';
+
+        $msg = <<<MSG
+        📅 *Monthly Summary — {$monthLabel}*
+        ─────────────────────────
+        ✅ *Total Income*    : `+{$this->fmt($income)} BDT`
+        🔴 *Total Expenses*  : `-{$this->fmt($expense)} BDT`
+        ─────────────────────────
+        {$balanceIcon} *Net Balance*    : `{$balanceSign}{$this->fmt($balance)} BDT`
+        🔢 *Total Logs*     : `{$txCount} entries`
+        MSG;
+
+        $this->telegram->sendMessage($chatId, $msg);
+    }
+
+    private function handleReset(TgUser $user, string $chatId): void
+    {
+        $deleted = DB::transaction(function () use ($user): int {
+            return Transaction::where('tg_user_id', $user->id)->delete();
+        });
+
+        $msg = <<<MSG
+        🗑 *Reset Complete!*
+
+        All *{$deleted}* of your database logs have been permanently dropped.
+        Your accounting ledger balance is back to *0.00 BDT*.
+        MSG;
+
+        $this->telegram->sendMessage($chatId, $msg);
+    }
+
     private function handleUnknown(string $chatId): void
     {
         $msg = <<<MSG
@@ -239,9 +295,9 @@ class TelegramController extends Controller
         `/income [amount] [description]`
         `/expense [amount] [description]`
         `/report`
+        `/report monthly`
+        `/reset`
         `/start`
-
-        _Example:_ `/income 2000 Freelance payment`
         MSG;
 
         $this->telegram->sendMessage($chatId, $msg);
