@@ -20,9 +20,10 @@ class TelegramController extends Controller
         private readonly TelegramService $telegram
     ) {}
 
-    /**
-     * Entry point for all incoming Telegram webhook payloads.
-     */
+    // ---------------------------------------------------------------
+    //  Webhook Entry Point
+    // ---------------------------------------------------------------
+
     public function handle(Request $request): Response
     {
         $payload = $request->json()->all();
@@ -50,14 +51,16 @@ class TelegramController extends Controller
             );
 
             $this->dispatch($user, $chatId, $text);
+
         } catch (Throwable $e) {
             Log::error('Telegram webhook error', [
                 'chat_id' => $chatId,
                 'error'   => $e->getMessage(),
+                'trace'   => $e->getTraceAsString(),
             ]);
             $this->telegram->sendMessage(
                 $chatId,
-                '⚠️ An unexpected error occurred. Please try again.'
+                '⚠️ An unexpected error occurred\. Please try again\.'
             );
         }
 
@@ -77,6 +80,7 @@ class TelegramController extends Controller
         }
 
         // /income <amount> [optional description]
+        // Description is fully optional — \s*(.*)$ prevents "Undefined array key 2"
         if (preg_match('/^\/income\s+(\d+(?:\.\d{1,2})?)\s*(.*)$/i', $text, $matches)) {
             $description = trim($matches[2]) !== '' ? trim($matches[2]) : 'Uncategorized Income';
             $this->handleTransaction($user, $chatId, 'income', $matches[1], $description);
@@ -90,15 +94,16 @@ class TelegramController extends Controller
             return;
         }
 
-        // /report monthly
+        // ⚠️  /report monthly MUST be matched BEFORE plain /report
+        // to prevent the shorter pattern swallowing the full command
         if (preg_match('/^\/report\s+monthly$/i', $text)) {
             $this->handleMonthlyReport($user, $chatId);
             return;
         }
 
-        // /report (daily)
+        // /report  (daily)
         if (preg_match('/^\/report$/i', $text)) {
-            $this->handleReport($user, $chatId);
+            $this->handleDailyReport($user, $chatId);
             return;
         }
 
@@ -108,47 +113,50 @@ class TelegramController extends Controller
             return;
         }
 
-        // Unknown / malformed input
+        // Fallback
         $this->handleUnknown($chatId);
     }
 
     // ---------------------------------------------------------------
-    //  Handlers
+    //  /start
     // ---------------------------------------------------------------
 
     private function handleStart(string $chatId, TgUser $user): void
     {
         $name = $user->first_name ?? 'there';
 
-        $msg = <<<MSG
-        👋 *Hello, {$name}!* Welcome to your personal *Income & Expense Tracker Bot*.
-
-        Here is everything I can do for you:
-
-        ➕ *Log Income*
-        `/income [amount] [description]`
-        _Example:_ `/income 5000 Monthly salary`
-
-        ➖ *Log Expense*
-        `/expense [amount] [description]`
-        _Example:_ `/expense 150 Grocery shopping`
-
-        📊 *Daily Report*
-        `/report`
-
-        📅 *Monthly Report*
-        `/report monthly`
-
-        🗑 *Reset Data*
-        `/reset`
-
-        ---
-        All amounts are treated as *BDT* by default.
-        Let's start tracking! 💪
-        MSG;
+        $msg = implode("\n", [
+            "👋 *Hello, {$name}\!*",
+            "",
+            "Welcome to your personal *Income & Expense Tracker Bot*\.",
+            "Here's what you can do:",
+            "",
+            "➕ *Log Income*",
+            "`/income [amount] [description]`",
+            "_Example:_ `/income 500 Freelance payment`",
+            "",
+            "➖ *Log Expense*",
+            "`/expense [amount] [description]`",
+            "_Example:_ `/expense 120 Grocery shopping`",
+            "",
+            "📊 *Today's Detailed Report*",
+            "`/report`",
+            "",
+            "📅 *Monthly Day\-by\-Day Report*",
+            "`/report monthly`",
+            "",
+            "🗑 *Reset All Transactions*",
+            "`/reset`",
+            "",
+            "Let's start tracking\! 💰",
+        ]);
 
         $this->telegram->sendMessage($chatId, $msg);
     }
+
+    // ---------------------------------------------------------------
+    //  /income  &  /expense
+    // ---------------------------------------------------------------
 
     private function handleTransaction(
         TgUser $user,
@@ -162,7 +170,7 @@ class TelegramController extends Controller
         if ($amount <= 0) {
             $this->telegram->sendMessage(
                 $chatId,
-                '❌ *Invalid amount.* Please enter a positive number greater than zero.'
+                '❌ *Invalid amount\.* Please enter a positive number greater than zero\.'
             );
             return;
         }
@@ -176,140 +184,270 @@ class TelegramController extends Controller
             ]);
         });
 
-        $formatted = number_format($amount, 2);
+        $formatted = number_format($amount, 2) . ' BDT';
+        $timeLabel = Carbon::now()->format('h:i A');
 
         if ($type === 'income') {
-            $msg = <<<MSG
-            ✅ *Income Recorded*
-
-            💰 Amount      : `+{$formatted} BDT`
-            📝 Description : {$description}
-            🕒 Time        : {$this->nowFormatted()}
-            MSG;
+            $sign  = '+';
+            $icon  = '💚';
+            $label = 'Income';
         } else {
-            $msg = <<<MSG
-            🔴 *Expense Recorded*
-
-            💰 Amount      : `-{$formatted} BDT`
-            📝 Description : {$description}
-            🕒 Time        : {$this->nowFormatted()}
-            MSG;
+            $sign  = '-';
+            $icon  = '🔴';
+            $label = 'Expense';
         }
+
+        $escapedDesc = $this->escape($description);
+
+        $msg = implode("\n", [
+            "✅ *{$label} Logged\!*",
+            "",
+            "{$icon} *Amount:* {$sign}{$formatted}",
+            "📝 *Description:* {$escapedDesc}",
+            "🕐 *Time:* {$timeLabel}",
+            "📆 *Date:* " . $this->escape(Carbon::today()->toFormattedDateString()),
+        ]);
 
         $this->telegram->sendMessage($chatId, $msg);
     }
 
-    private function handleReport(TgUser $user, string $chatId): void
+    // ---------------------------------------------------------------
+    //  /report  —  Daily detailed line-by-line report
+    // ---------------------------------------------------------------
+
+    private function handleDailyReport(TgUser $user, string $chatId): void
     {
         $today = Carbon::today();
 
-        $totals = Transaction::query()
+        /** @var \Illuminate\Support\Collection $transactions */
+        $transactions = Transaction::query()
             ->where('tg_user_id', $user->id)
             ->whereDate('created_at', $today)
-            ->selectRaw("
-                COALESCE(SUM(CASE WHEN type = 'income'  THEN amount ELSE 0 END), 0) AS total_income,
-                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense
-            ")
-            ->first();
+            ->orderBy('created_at', 'asc')
+            ->get(['type', 'amount', 'description', 'created_at']);
 
-        $income  = (float) $totals->total_income;
-        $expense = (float) $totals->total_expense;
-        $balance = $income - $expense;
+        if ($transactions->isEmpty()) {
+            $this->telegram->sendMessage(
+                $chatId,
+                "📊 *Daily Report — " . $this->escape($today->toFormattedDateString()) . "*\n\n"
+                . "_No transactions logged today\._"
+            );
+            return;
+        }
 
-        $balanceIcon = $balance >= 0 ? '🟢' : '🔴';
+        $totalIncome  = 0.0;
+        $totalExpense = 0.0;
+        $lines        = [];
+
+        foreach ($transactions as $tx) {
+            $time        = Carbon::parse($tx->created_at)->format('h:i A');
+            $amount      = (float) $tx->amount;
+            $isIncome    = $tx->type === 'income';
+            $sign        = $isIncome ? '+' : '-';
+            $typeLabel   = $isIncome ? '💚 Income' : '🔴 Expense';
+            $formatted   = number_format($amount, 2) . ' BDT';
+            $escapedDesc = $this->escape($tx->description);
+
+            // • [10:30 AM] 💚 Income  +120.00 BDT - Grocery
+            $lines[] = "• \[{$time}\] {$typeLabel}  {$sign}{$formatted} \- {$escapedDesc}";
+
+            if ($isIncome) {
+                $totalIncome += $amount;
+            } else {
+                $totalExpense += $amount;
+            }
+        }
+
+        $balance     = $totalIncome - $totalExpense;
+        $balanceIcon = $balance >= 0 ? '💚' : '🔴';
         $balanceSign = $balance >= 0 ? '+' : '-';
+        $dateLabel   = $this->escape($today->toFormattedDateString());
 
-        $msg = <<<MSG
-        📊 *Daily Report — {$today->format('d M Y')}*
-        ─────────────────────────
-        ✅ *Total Income*  : `+{$this->fmt($income)} BDT`
-        🔴 *Total Expense* : `-{$this->fmt($expense)} BDT`
-        ─────────────────────────
-        {$balanceIcon} *Net Balance*  : `{$balanceSign}{$this->fmt($balance)} BDT`
-        MSG;
+        $msg = implode("\n", array_merge(
+            [
+                "📊 *Daily Report — {$dateLabel}*",
+                "",
+            ],
+            $lines,
+            [
+                "",
+                "────────────────────────",
+                "➕ *Total Income:*   " . number_format($totalIncome,  2) . " BDT",
+                "➖ *Total Expenses:* " . number_format($totalExpense, 2) . " BDT",
+                "────────────────────────",
+                "{$balanceIcon} *Net Balance:*   {$balanceSign}" . number_format(abs($balance), 2) . " BDT",
+            ]
+        ));
 
         $this->telegram->sendMessage($chatId, $msg);
     }
+
+    // ---------------------------------------------------------------
+    //  /report monthly  —  Day-by-day nested breakdown
+    // ---------------------------------------------------------------
 
     private function handleMonthlyReport(TgUser $user, string $chatId): void
     {
         $now        = Carbon::now();
         $monthStart = $now->copy()->startOfMonth();
         $monthEnd   = $now->copy()->endOfMonth();
-        $monthLabel = $now->format('F Y');
+        $monthLabel = $this->escape($now->format('F Y')); // e.g. May 2026
 
-        $totals = Transaction::query()
+        /** @var \Illuminate\Support\Collection $transactions */
+        $transactions = Transaction::query()
             ->where('tg_user_id', $user->id)
             ->whereBetween('created_at', [$monthStart, $monthEnd])
-            ->selectRaw("
-                COALESCE(SUM(CASE WHEN type = 'income'  THEN amount ELSE 0 END), 0) AS total_income,
-                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense,
-                COUNT(*) AS total_transactions
-            ")
-            ->first();
+            ->orderBy('created_at', 'asc')
+            ->get(['type', 'amount', 'description', 'created_at']);
 
-        $income  = (float) ($totals->total_income  ?? 0);
-        $expense = (float) ($totals->total_expense ?? 0);
-        $txCount = (int)   ($totals->total_transactions ?? 0);
-        $balance = $income - $expense;
+        if ($transactions->isEmpty()) {
+            $this->telegram->sendMessage(
+                $chatId,
+                "📅 *Monthly Report — {$monthLabel}*\n\n"
+                . "_No transactions logged for this month\._"
+            );
+            return;
+        }
 
-        $balanceIcon = $balance >= 0 ? '🟢' : '🔴';
-        $balanceSign = $balance >= 0 ? '+' : '-';
+        // Group by calendar date string e.g. "2026-05-27"
+        $grouped = $transactions->groupBy(
+            fn ($tx) => Carbon::parse($tx->created_at)->toDateString()
+        );
 
-        $msg = <<<MSG
-        📅 *Monthly Summary — {$monthLabel}*
-        ─────────────────────────
-        ✅ *Total Income*    : `+{$this->fmt($income)} BDT`
-        🔴 *Total Expenses*  : `-{$this->fmt($expense)} BDT`
-        ─────────────────────────
-        {$balanceIcon} *Net Balance*    : `{$balanceSign}{$this->fmt($balance)} BDT`
-        🔢 *Total Logs*     : `{$txCount} entries`
-        MSG;
+        $grandIncome   = 0.0;
+        $grandExpense  = 0.0;
+        $totalTxCount  = 0;
+        $sections      = [];
+
+        foreach ($grouped as $dateString => $dayTransactions) {
+            $dayLabel    = $this->escape(Carbon::parse($dateString)->format('F j, Y'));
+            $dayIncome   = 0.0;
+            $dayExpense  = 0.0;
+            $dayLines    = ["📅 *{$dayLabel}*"];
+
+            foreach ($dayTransactions as $tx) {
+                $time        = Carbon::parse($tx->created_at)->format('h:i A');
+                $amount      = (float) $tx->amount;
+                $isIncome    = $tx->type === 'income';
+                $sign        = $isIncome ? '+' : '-';
+                $typeLabel   = $isIncome ? '💚 Income' : '🔴 Expense';
+                $formatted   = number_format($amount, 2) . ' BDT';
+                $escapedDesc = $this->escape($tx->description);
+
+                $dayLines[] = "• \[{$time}\] {$typeLabel}  {$sign}{$formatted} \- {$escapedDesc}";
+
+                if ($isIncome) {
+                    $dayIncome += $amount;
+                } else {
+                    $dayExpense += $amount;
+                }
+
+                $totalTxCount++;
+            }
+
+            // Per-day mini summary
+            $dayBalance     = $dayIncome - $dayExpense;
+            $dayBalIcon     = $dayBalance >= 0 ? '💚' : '🔴';
+            $dayBalSign     = $dayBalance >= 0 ? '+' : '-';
+            $dayLines[]     = "_Day total: {$dayBalIcon} {$dayBalSign}" . number_format(abs($dayBalance), 2) . " BDT_";
+
+            $grandIncome  += $dayIncome;
+            $grandExpense += $dayExpense;
+
+            $sections[] = implode("\n", $dayLines);
+        }
+
+        $grandBalance     = $grandIncome - $grandExpense;
+        $grandBalanceIcon = $grandBalance >= 0 ? '💚' : '🔴';
+        $grandBalanceSign = $grandBalance >= 0 ? '+' : '-';
+
+        $footer = implode("\n", [
+            "════════════════════════",
+            "📅 *Grand Total — {$monthLabel}*",
+            "════════════════════════",
+            "➕ *Total Income:*      " . number_format($grandIncome,       2) . " BDT",
+            "➖ *Total Expenses:*    " . number_format($grandExpense,      2) . " BDT",
+            "────────────────────────",
+            "{$grandBalanceIcon} *Net Balance:*      {$grandBalanceSign}" . number_format(abs($grandBalance), 2) . " BDT",
+            "🔢 *Total Transactions:* {$totalTxCount}",
+        ]);
+
+        // Stitch header + all day sections + footer
+        $msg = implode("\n\n", array_merge(
+            ["📅 *Monthly Report — {$monthLabel}*"],
+            $sections,
+            [$footer]
+        ));
 
         $this->telegram->sendMessage($chatId, $msg);
     }
+
+    // ---------------------------------------------------------------
+    //  /reset
+    // ---------------------------------------------------------------
 
     private function handleReset(TgUser $user, string $chatId): void
     {
-        $deleted = DB::transaction(function () use ($user): int {
-            return Transaction::where('tg_user_id', $user->id)->delete();
-        });
+        $deleted = DB::transaction(
+            fn (): int => Transaction::where('tg_user_id', $user->id)->delete()
+        );
 
-        $msg = <<<MSG
-        🗑 *Reset Complete!*
-
-        All *{$deleted}* of your database logs have been permanently dropped.
-        Your accounting ledger balance is back to *0.00 BDT*.
-        MSG;
+        $msg = implode("\n", [
+            "🗑 *Reset Complete\!*",
+            "",
+            "All *{$deleted}* of your transaction records have been permanently deleted\.",
+            "Your balance is now back to *0\.00 BDT*\.",
+            "",
+            "Ready to start fresh? Use `/income` or `/expense` to begin tracking again\.",
+        ]);
 
         $this->telegram->sendMessage($chatId, $msg);
     }
+
+    // ---------------------------------------------------------------
+    //  Fallback
+    // ---------------------------------------------------------------
 
     private function handleUnknown(string $chatId): void
     {
-        $msg = <<<MSG
-        🤔 *I didn't understand that command.*
-
-        Here are the valid commands:
-
-        `/income [amount] [description]`
-        `/expense [amount] [description]`
-        `/report`
-        `/report monthly`
-        `/reset`
-        `/start`
-        MSG;
+        $msg = implode("\n", [
+            "🤔 *I didn't understand that\.*",
+            "",
+            "Here are the supported commands:",
+            "",
+            "`/start`                               — Welcome message & guide",
+            "`/income [amount] [description]`       — Log income",
+            "`/expense [amount] [description]`      — Log expense",
+            "`/report`                              — Today's detailed report",
+            "`/report monthly`                      — This month's day\-by\-day report",
+            "`/reset`                               — Delete all your transactions",
+            "",
+            "_Example:_ `/income 250 Salary advance`",
+        ]);
 
         $this->telegram->sendMessage($chatId, $msg);
     }
 
-    private function fmt(float $value): string
+    // ---------------------------------------------------------------
+    //  Helpers
+    // ---------------------------------------------------------------
+
+    /**
+     * Today's date as a formatted string, e.g. "May 27, 2026".
+     */
+    private function today(): string
     {
-        return number_format(abs($value), 2);
+        return Carbon::today()->toFormattedDateString();
     }
 
-    private function nowFormatted(): string
+    /**
+     * Escape all MarkdownV2 reserved characters so Telegram
+     * does not misparse them as formatting tokens.
+     *
+     * Reserved chars: _ * [ ] ( ) ~ ` > # + - = | { } . !
+     */
+    private function escape(string $text): string
     {
-        return Carbon::now()->format('d M Y, h:i A');
+        return preg_replace('/([_*\[\]()~`>#+\-=|{}.!])/', '\\\\$1', $text);
     }
 }
