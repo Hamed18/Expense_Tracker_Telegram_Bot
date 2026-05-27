@@ -1,0 +1,25 @@
+
+8863310054:AAHIQ-0Jo_5K0xVUpU82KpUvzy9A4iLO6iQ
+
+making request
+https://api.telegram.org/bot<token>/METHOD_NAME  (getMe)
+
+https://api.telegram.org/bot8863310054:AAHIQ-0Jo_5K0xVUpU82KpUvzy9A4iLO6iQ/sendMessage?chat_id
+
+https://api.telegram.org/bot8863310054:AAHIQ-0Jo_5K0xVUpU82KpUvzy9A4iLO6iQ/getUpdates
+
+https://web.telegram.org/a/#8863310054
+
+=======================================================================================================
+
+to get to know the update from the bot at user end:
+https://api.telegram.org/bot8863310054:AAHIQ-0Jo_5K0xVUpU82KpUvzy9A4iLO6iQ/getUpdates
+
+to send msg to bot from user end:
+https://api.telegram.org/bot8863310054:AAHIQ-0Jo_5K0xVUpU82KpUvzy9A4iLO6iQ/sendMessage?chat_id=6061636007&&text=can you help me?
+
+========================================================================================================
+https://a1b2-34-56-78.ngrok-free.app/api/telegram/webhook
+
+ngork auth token: cr_3EITvbIbo7IwATx12vnIZCRyWNI
+
