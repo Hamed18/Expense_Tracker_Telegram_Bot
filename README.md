@@ -1,4 +1,9 @@
 ```markdown
+# Author Details
+Name: Mohammod Hamed Hasan
+Email: hamedhasan.dev@gmail.com
+LinkedIn: https://www.linkedin.com/in/devhamed/
+
 # Income & Expense Tracker Bot
 
 A real-time, conversational financial ledger bot built with Laravel 12, Telegram Bot API, and XAMPP (MySQL). This application allows users to seamlessly track incomes and expenses directly through a Telegram chat interface, rendering line-by-line chronological reports and day-by-day monthly breakdowns.
